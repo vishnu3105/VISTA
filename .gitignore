@@ -1,0 +1,5 @@
+echo "*.mp4" > .gitignore
+echo "*.pt" >> .gitignore
+echo "*.pth" >> .gitignore
+echo "__pycache__/" >> .gitignore
+echo "*.pyc" >> .gitignore
