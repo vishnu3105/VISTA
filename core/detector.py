@@ -116,25 +116,36 @@ class TicketAbuseDetector:
 class StampedeDetector:
     """
     Fires when a crowd shows simultaneous lean + unidirectional movement.
-    Uses pose torso angles + optical flow vectors.
+    Uses pose torso angles + average tracker velocity (replacing optical flow).
     """
 
     def __init__(self, tilt_thresh=28.0, crowd_frac=0.55, flow_mag=3.5):
         self.tilt_thresh  = tilt_thresh   # degrees from vertical
         self.crowd_frac   = crowd_frac    # fraction of crowd that must be tilted
-        self.flow_mag     = flow_mag      # min optical flow magnitude
-        self._prev_gray   = None
+        self.flow_mag     = flow_mag      # min velocity magnitude
         self._flow_vec    = (0.0, 0.0)
 
-    def update_flow(self, gray: np.ndarray):
-        if self._prev_gray is not None:
-            flow = cv2.calcOpticalFlowFarneback(
-                self._prev_gray, gray, None,
-                pyr_scale=0.5, levels=3, winsize=15,
-                iterations=3, poly_n=5, poly_sigma=1.2, flags=0
-            )
-            self._flow_vec = (float(flow[..., 0].mean()), float(flow[..., 1].mean()))
-        self._prev_gray = gray.copy()
+    def update_flow(self, active_states: list[PersonState]):
+        """Calculates crowd flow using ByteTrack velocities instead of dense optical flow."""
+        vx, vy, count = 0.0, 0.0, 0
+        now = time.time()
+        for state in active_states:
+            # Need at least 2 points to compute velocity, taken within last 1.5 seconds
+            recent_pos = [(cx, cy, t) for cx, cy, t in state.positions if now - t < 1.5]
+            if len(recent_pos) >= 5: # Require at least 5 frames of history
+                p1 = recent_pos[0]
+                p2 = recent_pos[-1]
+                dt = p2[2] - p1[2]
+                if dt > 0:
+                    vx += (p2[0] - p1[0]) / dt
+                    vy += (p2[1] - p1[1]) / dt
+                    count += 1
+        
+        if count > 0:
+            # Average pixels per second, normalized to match old optical flow scale (~30 fps)
+            self._flow_vec = ((vx / count) / 30.0, (vy / count) / 30.0)
+        else:
+            self._flow_vec = (0.0, 0.0)
 
     def check(self, angles: list[Optional[float]], camera_id: int) -> Optional[Alert]:
         valid = [a for a in angles if a is not None]
@@ -164,11 +175,13 @@ class VISTADetector:
         camera_id: int = 0,
         source: int | str = 0,
         gate_roi: tuple = (200, 300, 440, 480),
-        conf: float = 0.4,
+        conf: float = 0.6,
     ):
         self.camera_id  = camera_id
         self.source     = source
         self.conf       = conf
+        self.output_path = None
+        self.writer     = None
 
         self.model      = YOLO("yolov8n-pose.pt")
         self.model.to("cuda")
@@ -185,8 +198,9 @@ class VISTADetector:
 
         self.states: dict[int, PersonState] = defaultdict(lambda: PersonState(track_id=-1))
         self.alerts: list[Alert] = []
-        self.reid = ReIDGallery(sim_threshold=0.89, ttl_sec=60.0)
+        self.reid = ReIDGallery(sim_threshold=0.75, ttl_sec=30.0)
         self.local_to_global: dict[int, int] = {}
+        self.id_consensus: dict[int, list[int]] = defaultdict(list) # track_id -> [candidate_ids]
 
         # Annotators
         self.box_ann  = sv.BoxAnnotator(thickness=2)
@@ -199,10 +213,8 @@ class VISTADetector:
         self._frame_count += 1
         frame = cv2.resize(frame, (640, 360))
         frame_alerts = []
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.stampede.update_flow(gray)
 
-        results = self.model(frame, conf=self.conf, verbose=False)[0]
+        results = self.model(frame, conf=self.conf, verbose=False, half=True)[0]
 
         # Convert to supervision detections
         detections = sv.Detections.from_ultralytics(results)
@@ -212,29 +224,55 @@ class VISTADetector:
         torso_angles = []
 
         tracker_ids = detections.tracker_id if detections.tracker_id is not None else []
+
+        # Collect all crops for batch ReID
+        crops = []
+        valid_data = []
         for i, (box, track_id) in enumerate(zip(detections.xyxy, tracker_ids)):
             if track_id is None:
                 continue
+            
+            x1b, y1b, x2b, y2b = map(int, box)
+            w_box, h_box = x2b - x1b, y2b - y1b
+            
+            # Skip tiny detections early to maintain list synchronization
+            if w_box < 32 or h_box < 64: 
+                continue
 
             kps = keypoints_all[i] if i < len(keypoints_all) else None
-            cx = (box[0] + box[2]) / 2
-            cy = (box[1] + box[3]) / 2
+            cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+            
+            # RAZOR SHARP: Full body crop with 5% padding
+            # Quality Check: Only ReID if box is large enough for meaningful features
+            if h_box < 100 or w_box < 40:
+                continue
 
-            # ReID every 10 frames
-            if self._frame_count % 20 == 0:
-                x1b, y1b, x2b, y2b = map(int, box)
-                h = y2b - y1b
-# Use middle 60% of bbox height (torso region)
-                torso_y1 = y1b + int(h * 0.15)
-                torso_y2 = y1b + int(h * 0.75)
-                crop = frame[max(0,torso_y1):torso_y2, max(0,x1b):x2b] 
-                if crop.size > 0:
-                    global_id, _ = self.reid.update(self.camera_id, int(track_id), crop)
-                else:
-                    global_id = self.local_to_global.get(track_id, track_id)
-                self.local_to_global[track_id] = global_id
+            pw, ph = int(w_box * 0.05), int(h_box * 0.05)
+            crop = frame[max(0, y1b-ph):min(frame.shape[0], y2b+ph), 
+                         max(0, x1b-pw):min(frame.shape[1], x2b+pw)]
+            
+            if crop.size > 0:
+                crops.append(crop)
+                valid_data.append((i, box, track_id, kps, cx, cy))
+
+        # Batch ReID inference every 2 frames
+        if crops and self._frame_count % 2 == 0:
+            embeddings = self.reid._embed_batch(crops)
+            # We will implement match_batch in reid.py for Hungarian assignment
+            if hasattr(self.reid, "match_batch"):
+                matches = self.reid.match_batch(valid_data, embeddings, self.camera_id)
+                self.local_to_global.update(matches)
             else:
-                global_id = self.local_to_global.get(track_id, track_id)
+                # Fallback until reid.py is updated
+                for idx, (_, _, track_id, _, _, _) in enumerate(valid_data):
+                    gid = self.reid.update_with_embedding(int(track_id), embeddings[idx], self.camera_id)
+                    self.local_to_global[track_id] = gid
+
+        # Main processing loop
+        for i, (box, track_id, kps, cx, cy) in enumerate([(d[1], d[2], d[3], d[4], d[5]) for d in valid_data]):
+            # STICKY ID logic: If we already have a mapping for this track_id, keep it!
+            # Only let match_batch override it if track_id is not in local_to_global.
+            global_id = self.local_to_global.get(track_id, track_id)
 
             state = self.states[track_id]
             state.track_id = track_id
@@ -257,6 +295,8 @@ class VISTADetector:
                         confidence=0.85, frame=frame.copy()
                     ))
 
+        active_states = [self.states[tid] for tid in tracker_ids if tid is not None]
+        self.stampede.update_flow(active_states)
         s_alert = self.stampede.check(torso_angles, self.camera_id)
         if s_alert:
             frame_alerts.append(s_alert)
@@ -292,6 +332,8 @@ class VISTADetector:
                 self._frame_count += 1
                 continue
 
+            annotated, frame_alerts = self._process_frame(frame)
+
             for a in frame_alerts:
                 print(f"[ALERT] {a.kind.upper()} | cam={a.camera_id} | ids={a.track_ids} | conf={a.confidence:.2f}")
 
@@ -304,8 +346,17 @@ class VISTADetector:
         cap.release()
         cv2.destroyAllWindows()
         
-    def run(self, display: bool = True):
+    def run(self, display: bool = True, output: Optional[str] = None):
         cap = cv2.VideoCapture(self.source)
+        if output:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            # Get frame size from cap
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            # We resize to 960x540 in our display logic, let's save at that res for clarity
+            self.writer = cv2.VideoWriter(output, fourcc, 20.0, (960, 540))
+            print(f"[VISTA] Recording output to {output}...")
+
         print(f"[VISTA] Camera {self.camera_id} started. Press Q to quit.")
 
         while cap.isOpened():
@@ -316,17 +367,20 @@ class VISTADetector:
             annotated, frame_alerts = self._process_frame(frame)
             self.alerts.extend(frame_alerts)
 
-            for a in frame_alerts:
-                print(f"[ALERT] {a.kind.upper()} | cam={a.camera_id} | ids={a.track_ids} | conf={a.confidence:.2f}")
+            # Resize for display/output
+            annotated_resized = cv2.resize(annotated, (960, 540))
+
+            if self.writer:
+                self.writer.write(annotated_resized)
 
             if display:
-    # resize window to fit screen
-             annotated = cv2.resize(annotated, (960, 540))
-             cv2.imshow("VISTA", annotated)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-             break
+                cv2.imshow("VISTA", annotated_resized)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
 
         cap.release()
+        if self.writer:
+            self.writer.release()
         cv2.destroyAllWindows()
 
 
@@ -337,6 +391,7 @@ if __name__ == "__main__":
     p.add_argument("--camera-id", type=int, default=0)
     p.add_argument("--gate-roi", nargs=4, type=int, default=[200, 300, 440, 480],
                    metavar=("X1", "Y1", "X2", "Y2"))
+    p.add_argument("--output", default=None, help="Path to save output video")
     args = p.parse_args()
 
     detector = VISTADetector(
@@ -344,4 +399,4 @@ if __name__ == "__main__":
         source=args.source if args.source != "0" else 0,
         gate_roi=tuple(args.gate_roi),
     )
-    detector.run()
+    detector.run(output=args.output)
