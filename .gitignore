@@ -1,6 +1,29 @@
-*.mp4
-*.avi
-*.pt
-*.pth
+# Python Virtual Environments
+.venv/
+venv/
+
+# Environment configurations
+.env
+
+# Cache files
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Weight files / ML models (Too large for Git)
+*.pt
+*.pth
+*.engine
+*.onnx
+
+# Temporary, debug & backup files
+*.bak
+debug_output.txt
+osnet_keys.txt
+dict
+{type(v).__name__}
+
+# Video files (Avoid pushing large surveillance video inputs/outputs)
+*.mp4
+*.avi

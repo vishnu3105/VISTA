@@ -1,0 +1,51 @@
+# VISTA Production Dependencies
+# ================================
+# Python 3.10+  |  CUDA 11.8+  |  RTX 4060 (8 GB VRAM)
+#
+# Install order:
+#   1. Install PyTorch with CUDA first (see below)
+#   2. pip install -r requirements.txt
+#
+# PyTorch (CUDA 11.8):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+# PyTorch (CUDA 12.1):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# ── Core ML ──────────────────────────────────────────────────────────────────
+torch>=2.1.0                  # CUDA async streams, compile(), BF16 support
+torchvision>=0.16.0           # transforms, pretrained weights
+ultralytics>=8.1.0            # RT-DETR-X + YOLOv8x-pose (same package)
+
+# ── Tracking ─────────────────────────────────────────────────────────────────
+supervision>=0.19.0           # ByteTrack + annotation suite
+boxmot>=10.0.0                # BoT-SORT, StrongSORT, etc.
+
+# ── ReID / Vector search ─────────────────────────────────────────────────────
+faiss-cpu>=1.7.4              # GPU-accelerated approximate nearest-neighbour
+
+scipy>=1.11.0                 # linear_sum_assignment (Hungarian algorithm)
+
+# ── Image processing ─────────────────────────────────────────────────────────
+opencv-python-headless>=4.9.0 # cv2 — headless for server deployment
+                               # use opencv-python instead for local display
+numpy>=1.26.0
+
+# ── API ──────────────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0     # includes websockets, httptools
+websockets>=12.0
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+python-multipart>=0.0.9       # FastAPI file uploads
+pydantic>=2.6.0               # FastAPI models
+
+# ── Dev / debug (optional) ───────────────────────────────────────────────────
+# rich>=13.7.0                # pretty terminal output
+# tensorboard>=2.16.0         # training visualisation
+# pytest>=8.0.0               # tests
+
+# ── NOT included (intentionally) ─────────────────────────────────────────────
+# torchreid  — unmaintained, broken pip install. OSNet is built into reid.py
+# torchaudio — not needed
+# detectron2 — too heavy for this stack
